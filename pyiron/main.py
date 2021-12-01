@@ -20,33 +20,57 @@ def set_parameters(spx, n_cores=40, queue='cm', random=True):
     return spx
 
 
-def get_lattice_constant(pr):
-    murn = pr.inspect('murn_Fe')
-    return murn['output/equilibrium_volume']**(1 / 3)
+class Bulk:
+    def __init__(self, project):
+        self.project = project
 
+    def run_murnaghan(self):
+        for element, a_0 in zip(['Fe', 'Mn'], [2.83, 2.8]):
+            spx = self.project.create.job.Sphinx('bulk_{}'.format(element))
+            spx.structure = self.project.create.structure.crystal(element, 'bcc', a_0)
+            spx = set_parameters(spx, n_cores=4)
+            murn = spx.create_job('Murnaghan', 'murn_{}'.format(element))
+            if murn.status.initialized:
+                murn.run()
 
-def get_energy(element, pr, n_repeat=3, n_Mn=1):
-    if element == 'Fe':
-        return pr.inspect('murn_Fe')['output/equilibrium_energy'] / 2
-    elif element == 'Mn':
-        murn = pr.inspect('murn_sqs_{}_{}'.format(n_repeat, n_Mn))
-        N_Fe = np.sum(np.array(murn['output/structure/species'])[murn['output/structure/indices']] == 'Fe')
-        coeff = np.polyfit(murn['output/volume'], murn['output/energy'], 3)
-        return np.polyval(
-            coeff, get_lattice_constant()**3 * len(murn['output/structure/indices']) / 2
-        ) - N_Fe * get_energy('Fe')
-    else:
-        raise ValueError(element, 'not recognized')
+    def get_lattice_constant(self):
+        murn = self.project.inspect('murn_Fe')
+        if murn is None:
+            self.run_murnaghan()
+            return None
+        return murn['output/equilibrium_volume']**(1 / 3)
+
+    def get_energy(self, element, n_repeat=3, n_Mn=1):
+        if element == 'Fe':
+            murn = self.project.inspect('murn_Fe')
+            if murn is None:
+                self.run_murnaghan()
+                return None
+            return murn['output/equilibrium_energy'] / 2
+        elif element == 'Mn':
+            murn = self.project.inspect('murn_sqs_{}_{}'.format(n_repeat, n_Mn))
+            if murn is None:
+                self.run_murnaghan()
+                return None
+            indices = murn['output/structure/indices']
+            N_Fe = np.sum(np.array(murn['output/structure/species'])[indices] == 'Fe')
+            coeff = np.polyfit(murn['output/volume'], murn['output/energy'], 3)
+            return np.polyval(
+                coeff, self.get_lattice_constant()**3 * len(indices) / 2
+            ) - N_Fe * self.get_energy('Fe')
+        else:
+            raise ValueError(element, 'not recognized')
 
 
 class GrainBoundary:
-    def __init__(self, pr):
-        self.pr = pr
+    def __init__(self, project):
+        self.project = project
         self._energy_dict = None
         self._structure_dict = {}
+        self.bulk = Bulk(project=self.project)
 
     def job_table(self, full_table=True):
-        jt = self.pr.job_table(full_table=full_table)
+        jt = self.project.job_table(full_table=full_table)
         return jt[jt.job.str.startswith('spx_gb_')]
 
     @property
@@ -62,7 +86,7 @@ class GrainBoundary:
 
     def load_jobs(self):
         jt = self.job_table()
-        E_Fe = get_energy('Fe')
+        E_Fe = self.bulk.get_energy('Fe')
         for job_type in self.job_names:
             if any([
                 s in list(jt[jt.job.str.startswith(job_type)].status) for s in ['submitted', 'running']
@@ -71,7 +95,7 @@ class GrainBoundary:
             if any([k.startswith(job_type) for k in self._energy_dict.keys()]):
                 continue
             for job_name in jt[jt.job.str.startswith(job_type)].job:
-                spx = self.pr.inspect(job_name)
+                spx = self.project.inspect(job_name)
                 LL = spx['output/generic/cells'][-1]
                 EE = E_Fe * len(spx['input/structure/indices'])
                 self._energy_dict[job_type].append([
@@ -92,7 +116,7 @@ class GrainBoundary:
         if len(self._structure_dict) == 0:
             for k, v in self.energy_dict.items():
                 L, coeff = self._get_fit(*v.T, order=3)
-                structure = self.pr.load('{}_0c0'.format(k)).structure
+                structure = self.project.load('{}_0c0'.format(k)).structure
                 cell = structure.cell.flatten()
                 cell[cell.argmax()] = L
                 structure.set_cell(cell.reshape(3, 3), scale_atoms=True)
@@ -123,22 +147,22 @@ class GrainBoundary:
                     ss = ''
                 except ValueError:
                     pass
-            entry = self.pr.create.structure.aimsgb.info(axis, sigma)[sigma]
+            entry = self.project.create.structure.aimsgb.info(axis, sigma)[sigma]
             results[job_name] = np.array(entry['theta'])[
                 np.all(np.array(entry['plane']) == plane, axis=-1).any(axis=-1)
             ].min()
         return results
 
-    def get_segregation_energy(self, pr):
+    def get_segregation_energy(self):
         E_dict = {}
-        jt = self.pr.job_table()
+        jt = self.project.job_table()
         for job_name, structure in self.structures.items():
             E_lst = np.zeros(len(structure))
             equivalent_atoms = structure.get_symmetry(symprec=1.0e-2).arg_equivalent_atoms
             for atom_id in np.unique(equivalent_atoms):
                 job_name_Mn = '{}_{}'.format(job_name.replace('gb', 'gbMn'), atom_id)
                 if sum(jt.job == job_name_Mn) == 0:
-                    spx = self.pr.create.job.Sphinx('{}_{}'.format(job_name.replace('gb', 'gbMn'), atom_id))
+                    spx = self.project.create.job.Sphinx('{}_{}'.format(job_name.replace('gb', 'gbMn'), atom_id))
                     spx.structure = structure.copy()
                     spx.structure[atom_id] = 'Mn'
                     set_parameters(spx)
@@ -146,12 +170,12 @@ class GrainBoundary:
                     continue
                 if np.any([s == 'running' or s == 'submitted' for s in jt[jt.job == job_name_Mn].status]):
                     continue
-                spx = pr.inspect(job_name_Mn)
+                spx = self.project.inspect(job_name_Mn)
                 gb_energy = self.get_gb_energy()[job_name] * structure.cell.diagonal().prod() / structure.cell.max()
-                E_Fe = get_energy('Fe') * sum(
+                E_Fe = self.bulk.get_energy('Fe') * sum(
                     np.asarray(spx['input/structure/species'])[spx['input/structure/indices']] == 'Fe'
                 )
-                E = spx['output/generic/energy_pot'][-1] - 2 * gb_energy - E_Fe - get_energy('Mn', n_repeat=3)
+                E = spx['output/generic/energy_pot'][-1] - 2 * gb_energy - E_Fe - self.bulk.get_energy('Mn', n_repeat=3)
                 E_lst[equivalent_atoms == atom_id] = E
             if np.all(E_lst != 0):
                 E_dict[job_name] = E_lst
