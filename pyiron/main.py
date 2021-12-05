@@ -2,6 +2,62 @@ import numpy as np
 from collections import defaultdict
 
 
+class LammpsGB:
+    def __init__(self, project):
+        self.project = project
+        self.potential = '1997--Ackland-G-J--Fe--LAMMPS--ipr1'
+
+    @property
+    def bulk(self):
+        return self.job_bulk.get_structure()
+
+    @property
+    def job_bulk(self):
+        lmp = self.project.create.job.Lammps('bulk')
+        lmp.structure = self.project.create.structure.bulk('Fe', cubic=True)
+        lmp.potential = self.potential
+        lmp.calc_minimize(pressure=0)
+        if lmp.status.initialized:
+            lmp.run()
+        return lmp
+
+    @property
+    def mu(self):
+        return self.job_bulk['output/generic/energy_pot'][-1] / 2
+
+    def get_lmp_gb(self, axis, sigma, plane, target_width=30, n_max=100):
+        gb = self.project.create.structure.aimsgb.build(
+            axis=axis, sigma=sigma, plane=plane, initial_struct=self.bulk
+        )
+        repeat = np.max([np.rint(target_width / gb.cell.diagonal().max()), 1]).astype(int)
+        E_min = np.inf
+        if repeat * len(gb) > n_max:
+            return
+        for i in range(2):
+            for j in range(2):
+                structure = self.project.create.structure.aimsgb.build(
+                    axis=axis,
+                    sigma=sigma,
+                    plane=plane,
+                    uc_a=repeat,
+                    uc_b=repeat,
+                    delete_layer='{0}b{1}t{0}b{1}t'.format(i, j),
+                    initial_struct=self.bulk
+                )
+                lmp = self.project.create.job.Lammps(('lmp_gb', *axis, sigma, *plane, i, j))
+                if lmp.status.initialized:
+                    lmp.potential = self.potential
+                    lmp.structure = structure
+                    lmp.calc_minimize(pressure=0)
+                    lmp.run()
+                E_current = lmp.output.energy_pot[-1] - len(structure) * self.mu
+                if i + j == 0 or E_min > E_current + 1.0e-3:
+                    E_min = E_current
+                    min_structure = lmp.get_structure()
+                    min_structure.set_cell(lmp.output.cells[0], scale_atoms=True)
+        return min_structure
+
+
 def set_parameters(spx, n_cores=40, queue='cm', random=True):
     spx.set_convergence_precision(electronic_energy=1e-6)
     spx.set_kpoints(k_mesh_spacing=0.1)
