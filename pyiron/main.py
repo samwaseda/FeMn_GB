@@ -20,24 +20,51 @@ def set_parameters(spx, n_cores=40, queue='cm', random=True):
     return spx
 
 
+def get_values(neigh, species):
+    denom = np.unique(neigh.flattened.shells, return_counts=True)[1]
+    count = np.zeros(len(denom))
+    prod = species[neigh.flattened.atom_numbers] * 2 - 1
+    prod *= species[neigh.flattened.indices] * 2 - 1
+    np.add.at(count, neigh.flattened.shells - 1, prod)
+    return np.linalg.norm(count / denom - (1 - 2 * np.mean(species))**2)**2
+
+
+def get_sqs(structure, steps=1000, num_neighbors=58):
+    species = structure.get_chemical_indices().copy()
+    neigh = structure.get_neighbors(num_neighbors=num_neighbors)
+    current_value = get_values(neigh, species)
+    for i in range(steps):
+        ind_Fe = np.random.choice(np.where(species == 0)[0])
+        ind_Mn = np.random.choice(np.where(species == 1)[0])
+        species[ind_Fe], species[ind_Mn] = species[ind_Mn], species[ind_Fe]
+        new_value = get_values(neigh, species)
+        if new_value > current_value:
+            species[ind_Fe], species[ind_Mn] = species[ind_Mn], species[ind_Fe]
+        else:
+            current_value = new_value
+    structure[:] = 'Fe'
+    structure[np.where(species == 1)[0]] = 'Mn'
+    return structure
+
+
 class Bulk:
     def __init__(self, project):
         self.project = project
 
     def run_murnaghan(self):
-        for element, a_0 in zip(['Fe', 'Mn'], [2.83, 2.8]):
-            spx = self.project.create.job.Sphinx('bulk_{}'.format(element))
-            spx.structure = self.project.create.structure.crystal(element, 'bcc', a_0)
-            spx = set_parameters(spx, n_cores=4)
-            murn = spx.create_job('Murnaghan', 'murn_{}'.format(element))
-            if murn.status.initialized:
-                murn.run()
+        spx = self.project.create.job.Sphinx('bulk_Fe')
+        spx.structure = self.project.create.structure.crystal('Fe', 'bcc', 2.83)
+        spx = set_parameters(spx, n_cores=4)
+        murn = spx.create_job('Murnaghan', 'murn_Fe')
+        if murn.status.initialized:
+            murn.run()
 
-    def get_lattice_constant(self):
+    @property
+    def lattice_constant(self):
         murn = self.project.inspect('murn_Fe')
         if murn is None:
             self.run_murnaghan()
-            return None
+            raise ValueError('Wait for lattice constant to be ready')
         return murn['output/equilibrium_volume']**(1 / 3)
 
     def get_energy(self, element, n_repeat=3, n_Mn=1):
@@ -60,6 +87,22 @@ class Bulk:
             ) - N_Fe * self.get_energy('Fe')
         else:
             raise ValueError(element, 'not recognized')
+
+    def run_sqs(self, max_Mn_fraction=0.2):
+        for n_repeat in [2, 3]:
+            n_atoms = n_repeat**3 * 2
+            for n_Mn in np.arange(1, int(n_atoms * max_Mn_fraction)):
+                spx = self.project.create.job.Sphinx(('spx_sqs', n_repeat, n_Mn))
+                structure = self.project.create.structure.crystal(
+                    'Fe', 'bcc', self.lattice_constant
+                ).repeat(n_repeat)
+                structure[np.random.choice(n_atoms, n_Mn, replace=False)] = 'Mn'
+                if np.min([n_atoms - n_Mn, n_Mn]) > 3:
+                    structure = get_sqs(structure)
+                spx.structure = structure
+                spx = set_parameters(spx, n_cores=40 + 40 * (n_repeat - 2))
+                spx.calc_minimize()
+                spx.run()
 
 
 class GrainBoundary:
