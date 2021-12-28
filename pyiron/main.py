@@ -1,6 +1,6 @@
 import numpy as np
 from collections import defaultdict
-from pyiron_atomistics import PyironProject
+from pyiron_atomistics import Project as PyironProject
 
 
 class Project(PyironProject):
@@ -27,6 +27,7 @@ class LammpsGB:
         self.project = project
         self.potential = '1997--Ackland-G-J--Fe--LAMMPS--ipr1'
         self.max_sigma = 100
+        self.n_max = 100
 
     @property
     def bulk(self):
@@ -63,7 +64,7 @@ class LammpsGB:
         )
         repeat = np.max([np.rint(target_width / gb.cell.diagonal().max()), 1]).astype(int)
         E_min = np.inf
-        if repeat * len(gb) > n_max:
+        if repeat * len(gb) > self.n_max:
             return
         for i in range(2):
             for j in range(2):
@@ -93,12 +94,12 @@ class LammpsGB:
     def list_gb(self):
         results = defaultdict(list)
         for ix in range(4):
-            for iy in range(ix+1):
-                for iz in range(iy+1):
+            for iy in range(ix + 1):
+                for iz in range(iy + 1):
                     axis = [ix, iy, iz]
-                    if np.gcd.reduce(axis)!=1:
+                    if np.gcd.reduce(axis) != 1:
                         continue
-                    for k,v in pr.create.structure.aimsgb.info(axis, self.max_sigma).items():
+                    for k, v in self.project.create.structure.aimsgb.info(axis, self.max_sigma).items():
                         for p in np.unique(np.reshape(v['plane'], (-1, 3)), axis=0):
                             structure, energy = self._get_lmp_gb(axis, k, p)
                             results['energy'].append(energy)
