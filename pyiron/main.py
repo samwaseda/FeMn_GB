@@ -1,20 +1,44 @@
 import numpy as np
 from collections import defaultdict
+from pyiron_atomistics import PyironProject
+
+
+class Project(PyironProject):
+    def __init__(
+        self,
+        path='',
+        user=None,
+        sql_query=None,
+        default_working_directory=False,
+    ):
+        super().__init__(
+            path=path,
+            user=user,
+            sql_query=sql_query,
+            default_working_directory=default_working_directory,
+        )
+        self.lammps = LammpsGB(self)
+        self.bulk = Bulk(self)
+        self.grain_boundary = GrainBoundary(self)
 
 
 class LammpsGB:
-    def __init__(self, project):
+    def __init__(self, project, max_sigma=100):
         self.project = project
         self.potential = '1997--Ackland-G-J--Fe--LAMMPS--ipr1'
+        self.max_sigma = 100
 
     @property
     def bulk(self):
-        return self.job_bulk.get_structure()
+        return self._job_bulk.get_structure()
 
     @property
-    def job_bulk(self):
-        lmp = self.project.create.job.Lammps('bulk')
-        lmp.structure = self.project.create.structure.bulk('Fe', cubic=True)
+    def _job_bulk(self):
+        return self.get_job('bulk', self.project.create.structure.bulk('Fe', cubic=True))
+
+    def get_job(self, job_name, structure):
+        lmp = self.project.create.job.Lammps(job_name)
+        lmp.structure = structure
         lmp.potential = self.potential
         lmp.calc_minimize(pressure=0)
         if lmp.status.initialized:
@@ -23,9 +47,17 @@ class LammpsGB:
 
     @property
     def mu(self):
-        return self.job_bulk['output/generic/energy_pot'][-1] / 2
+        return self._job_bulk['output/generic/energy_pot'][-1] / 2
 
-    def get_lmp_gb(self, axis, sigma, plane, target_width=30, n_max=100):
+    def get_lmp_gb(self, axis, sigma, plane, target_width=30):
+        return self._get_lmp_gb(
+            axis=axis,
+            sigma=sigma,
+            plane=plane,
+            target_width=target_width,
+        )[0]
+
+    def _get_lmp_gb(self, axis, sigma, plane, target_width=30):
         gb = self.project.create.structure.aimsgb.build(
             axis=axis, sigma=sigma, plane=plane, initial_struct=self.bulk
         )
@@ -55,7 +87,27 @@ class LammpsGB:
                     E_min = E_current
                     min_structure = lmp.get_structure()
                     min_structure.set_cell(lmp.output.cells[0], scale_atoms=True)
-        return min_structure
+        return min_structure, E_min
+
+    @property
+    def list_gb(self):
+        results = defaultdict(list)
+        for ix in range(4):
+            for iy in range(ix+1):
+                for iz in range(iy+1):
+                    axis = [ix, iy, iz]
+                    if np.gcd.reduce(axis)!=1:
+                        continue
+                    for k,v in pr.create.structure.aimsgb.info(axis, self.max_sigma).items():
+                        for p in np.unique(np.reshape(v['plane'], (-1, 3)), axis=0):
+                            structure, energy = self._get_lmp_gb(axis, k, p)
+                            results['energy'].append(energy)
+                            results['axis'].append(axis)
+                            results['plane'].append(p)
+                            results['sigma'].append(k)
+                            results['structure'].append(structure)
+        results['id'] = np.unique(results['energy'], return_inverse=True)[1]
+        return results
 
 
 def set_parameters(spx, n_cores=40, queue='cm', random=True):
@@ -139,7 +191,7 @@ class Bulk:
             N_Fe = np.sum(np.array(murn['output/structure/species'])[indices] == 'Fe')
             coeff = np.polyfit(murn['output/volume'], murn['output/energy'], 3)
             return np.polyval(
-                coeff, self.get_lattice_constant()**3 * len(indices) / 2
+                coeff, self.lattice_constant**3 * len(indices) / 2
             ) - N_Fe * self.get_energy('Fe')
         else:
             raise ValueError(element, 'not recognized')
@@ -166,7 +218,6 @@ class GrainBoundary:
         self.project = project
         self._energy_dict = None
         self._structure_dict = {}
-        self.bulk = Bulk(project=self.project)
 
     def job_table(self, full_table=True):
         jt = self.project.job_table(full_table=full_table)
@@ -185,7 +236,7 @@ class GrainBoundary:
 
     def load_jobs(self):
         jt = self.job_table()
-        E_Fe = self.bulk.get_energy('Fe')
+        E_Fe = self.project.bulk.get_energy('Fe')
         for job_type in self.job_names:
             if any([
                 s in list(jt[jt.job.str.startswith(job_type)].status) for s in ['submitted', 'running']
@@ -271,10 +322,10 @@ class GrainBoundary:
                     continue
                 spx = self.project.inspect(job_name_Mn)
                 gb_energy = self.get_gb_energy()[job_name] * structure.cell.diagonal().prod() / structure.cell.max()
-                E_Fe = self.bulk.get_energy('Fe') * sum(
+                E_Fe = self.project.bulk.get_energy('Fe') * sum(
                     np.asarray(spx['input/structure/species'])[spx['input/structure/indices']] == 'Fe'
                 )
-                E = spx['output/generic/energy_pot'][-1] - 2 * gb_energy - E_Fe - self.bulk.get_energy('Mn', n_repeat=3)
+                E = spx['output/generic/energy_pot'][-1] - 2 * gb_energy - E_Fe - self.project.bulk.get_energy('Mn', n_repeat=3)
                 E_lst[equivalent_atoms == atom_id] = E
             if np.all(E_lst != 0):
                 E_dict[job_name] = E_lst
