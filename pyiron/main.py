@@ -360,7 +360,7 @@ class GrainBoundary:
 
     @property
     def c_0(self):
-        return concentration / 100
+        return self.concentration / 100
 
     @property
     def _celsius(self):
@@ -379,11 +379,13 @@ class GrainBoundary:
                 structure = self.structures[job_name].copy()
                 structure[np.random.random(len(E)) < self.get_occ_probability(E)] = 'Mn'
                 for j in range(7):
-                    spx = pr.create.job.Sphinx((
-                        job_name.replace('gb', 'gbMnMn'), temperature, concentration, i, j
+                    spx = self.project.create.job.Sphinx((
+                        job_name.replace('gb', 'gbMnMn'),
+                        self.temperature, self.concentration, i, j
                     ))
                     if not spx.status.initialized:
                         continue
+                    print(spx.job_name)
                     spx.structure = structure.copy()
                     set_parameters(spx, n_cores=40)
-                    spx.run()
+                    # spx.run()
