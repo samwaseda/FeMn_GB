@@ -230,6 +230,8 @@ class GrainBoundary:
         self._structure_dict = {}
         self.symprec = 1.0e-2
         self._segregation_energy = None
+        self.temperature = 600
+        self.concentration = 10
 
     def job_table(self, full_table=True):
         jt = self.project.job_table(full_table=full_table)
@@ -317,36 +319,39 @@ class GrainBoundary:
             ].min()
         return results
 
+    def _get_segregation_energy(self, job_name, structure):
+        E_lst = np.zeros(len(structure))
+        equivalent_atoms = structure.get_symmetry(symprec=self.symprec).arg_equivalent_atoms
+        gb_energy = self.get_gb_energy()[job_name] * structure.cell.diagonal().prod() / structure.cell.max()
+        E_Fe = self.project.bulk.get_energy('Fe') * (len(structure) - 1)
+        E_ref = 2 * gb_energy + E_Fe + self.project.bulk.get_energy('Mn', n_repeat=3)
+        for atom_id in np.unique(equivalent_atoms):
+            job_name_Mn = '{}_{}'.format(job_name.replace('gb', 'gbMn'), atom_id)
+            if len(self.project.job_table(job=job_name_Mn)) == 0:
+                spx = self.project.create.job.Sphinx((job_name.replace('gb', 'gbMn'), atom_id))
+                spx.structure = structure.copy()
+                spx.structure[atom_id] = 'Mn'
+                set_parameters(spx)
+                spx.run()
+                continue
+            if len(self.project.job_table(job=f'{job_name_Mn}_restart')) > 0:
+                job_name_Mn = job_name_Mn + '_restart'
+            if np.any([
+                s in ['running', 'submitted']
+                for s in self.project.job_table(job=job_name_Mn).status
+            ]):
+                continue
+            spx = self.project.inspect(job_name_Mn)
+            E = spx['output/generic/energy_pot'][-1] - E_ref
+            E_lst[equivalent_atoms == atom_id] = E
+        return E_lst
+
     @property
     def segregation_energy(self):
         if self._segregation_energy is None:
             self._segregation_energy = {}
             for job_name, structure in self.structures.items():
-                E_lst = np.zeros(len(structure))
-                equivalent_atoms = structure.get_symmetry(symprec=self.symprec).arg_equivalent_atoms
-                for atom_id in np.unique(equivalent_atoms):
-                    job_name_Mn = '{}_{}'.format(job_name.replace('gb', 'gbMn'), atom_id)
-                    if len(self.project.job_table(job=job_name_Mn)) == 0:
-                        spx = self.project.create.job.Sphinx((job_name.replace('gb', 'gbMn'), atom_id))
-                        spx.structure = structure.copy()
-                        spx.structure[atom_id] = 'Mn'
-                        set_parameters(spx)
-                        spx.run()
-                        continue
-                    if len(self.project.job_table(job=f'{job_name_Mn}_restart')) > 0:
-                        job_name_Mn = job_name_Mn + '_restart'
-                    if np.any([
-                        s == 'running' or s == 'submitted'
-                        for s in self.project.job_table(job=job_name_Mn).status
-                    ]):
-                        continue
-                    spx = self.project.inspect(job_name_Mn)
-                    gb_energy = self.get_gb_energy()[job_name] * structure.cell.diagonal().prod() / structure.cell.max()
-                    E_Fe = self.project.bulk.get_energy('Fe') * sum(
-                        np.asarray(spx['input/structure/species'])[spx['input/structure/indices']] == 'Fe'
-                    )
-                    E = spx['output/generic/energy_pot'][-1] - 2 * gb_energy - E_Fe - self.project.bulk.get_energy('Mn', n_repeat=3)
-                    E_lst[equivalent_atoms == atom_id] = E
+                E_lst = self._get_segregation_energy(job_name, structure)
                 if np.all(E_lst != 0):
                     self._segregation_energy[job_name] = E_lst
         return self._segregation_energy
