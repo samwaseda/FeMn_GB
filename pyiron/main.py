@@ -1,6 +1,7 @@
 import numpy as np
 from collections import defaultdict
 from pyiron_atomistics import Project as PyironProject
+import pint
 
 
 class Project(PyironProject):
@@ -232,6 +233,7 @@ class GrainBoundary:
         self._segregation_energy = None
         self.temperature = 600
         self.concentration = 10
+        self.unit = pint.UnitRegistry()
 
     def job_table(self, full_table=True):
         jt = self.project.job_table(full_table=full_table)
@@ -322,7 +324,7 @@ class GrainBoundary:
     def _get_segregation_energy(self, job_name, structure):
         E_lst = np.zeros(len(structure))
         equivalent_atoms = structure.get_symmetry(symprec=self.symprec).arg_equivalent_atoms
-        gb_energy = self.get_gb_energy()[job_name] * structure.cell.diagonal().prod() / structure.cell.max()
+        gb_energy = self.get_gb_energy()[job_name] * np.sort(structure.cell.diagonal())[:2].prod()
         E_Fe = self.project.bulk.get_energy('Fe') * (len(structure) - 1)
         E_ref = 2 * gb_energy + E_Fe + self.project.bulk.get_energy('Mn', n_repeat=3)
         for atom_id in np.unique(equivalent_atoms):
@@ -355,3 +357,33 @@ class GrainBoundary:
                 if np.all(E_lst != 0):
                     self._segregation_energy[job_name] = E_lst
         return self._segregation_energy
+
+    @property
+    def c_0(self):
+        return concentration / 100
+
+    @property
+    def _celsius(self):
+        return self.temperature + 273
+
+    @property
+    def kBT(self):
+        return (self._celsius * self.unit.kelvin * self.unit.boltzmann_constant).to('eV')
+
+    def get_occ_probability(self, E):
+        return 1 / (1 + (1 - self.c_0) / self.c_0 * np.exp(E / self.kBT))
+
+    def run_collective(self):
+        for job_name, E in self.segregation_energy.items():
+            for i in range(10):
+                structure = self.structures[job_name].copy()
+                structure[np.random.random(len(E)) < self.get_occ_probability(E)] = 'Mn'
+                for j in range(7):
+                    spx = pr.create.job.Sphinx((
+                        job_name.replace('gb', 'gbMnMn'), temperature, concentration, i, j
+                    ))
+                    if not spx.status.initialized:
+                        continue
+                    spx.structure = structure.copy()
+                    set_parameters(spx, n_cores=40)
+                    spx.run()
