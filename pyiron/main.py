@@ -80,12 +80,7 @@ class LammpsGB:
                     delete_layer=f'{i}b{j}t{i}b{j}t',
                     initial_struct=self.bulk
                 )
-                lmp = self.project.create.job.Lammps(('lmp_gb', *axis, sigma, *plane, i, j))
-                if lmp.status.initialized:
-                    lmp.potential = self.potential
-                    lmp.structure = structure
-                    lmp.calc_minimize(pressure=0)
-                    lmp.run()
+                lmp = self.get_job(('lmp_gb', *axis, sigma, *plane, i, j), structure)
                 E_current = lmp.output.energy_pot[-1] - len(structure) * self.mu
                 if i + j == 0 or E_min > E_current + 1.0e-3:
                     E_min = E_current
@@ -368,7 +363,9 @@ class GrainBoundary:
 
     @property
     def kBT(self):
-        return (self._celsius * self.unit.kelvin * self.unit.boltzmann_constant).to('eV')
+        return (
+            self._celsius * self.unit.kelvin * self.unit.boltzmann_constant
+        ).to('eV').magnitude
 
     def get_occ_probability(self, E):
         return 1 / (1 + (1 - self.c_0) / self.c_0 * np.exp(E / self.kBT))
