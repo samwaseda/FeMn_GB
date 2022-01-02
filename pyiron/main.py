@@ -215,7 +215,6 @@ class Bulk:
                     structure = get_sqs(structure)
                 spx.structure = structure
                 spx = set_parameters(spx, n_cores=40 + 40 * (n_repeat - 2))
-                spx.calc_minimize()
                 spx.run()
 
 
@@ -231,8 +230,7 @@ class GrainBoundary:
         self.unit = pint.UnitRegistry()
 
     def job_table(self, full_table=True):
-        jt = self.project.job_table(full_table=full_table)
-        return jt[jt.job.str.startswith('spx_gb_')]
+        return self.project.job_table(full_table=full_table, job='spx_gb_*')
 
     @property
     def job_names(self):
