@@ -175,7 +175,7 @@ class Bulk:
 
     @property
     def lattice_constant(self):
-        murn = self.project.inspect('murn_Fe')
+        murn = self.project.load('murn_Fe')
         if murn is None:
             self.run_murnaghan()
             raise ValueError('Wait for lattice constant to be ready')
@@ -183,13 +183,13 @@ class Bulk:
 
     def get_energy(self, element, n_repeat=3, n_Mn=1):
         if element == 'Fe':
-            murn = self.project.inspect('murn_Fe')
+            murn = self.project.load('murn_Fe')
             if murn is None:
                 self.run_murnaghan()
                 return None
             return murn['output/equilibrium_energy'] / 2
         elif element == 'Mn':
-            murn = self.project.inspect('murn_sqs_{}_{}'.format(n_repeat, n_Mn))
+            murn = self.project.load('murn_sqs_{}_{}'.format(n_repeat, n_Mn))
             if murn is None:
                 self.run_murnaghan()
                 return None
@@ -248,6 +248,7 @@ class GrainBoundary:
                     s in list(self.project.job_table(job=f'{job_type}*').status)
                     for s in ['submitted', 'running']
                 ]):
+                    print(job_type, 'running')
                     continue
                 if any([k.startswith(job_type) for k in self._energy_dict.keys()]):
                     continue
@@ -288,10 +289,10 @@ class GrainBoundary:
         results = {}
         for k, v in self.energy_dict.items():
             L, coeff = self._get_fit(*v.T, order=3)
-            E = np.polyval(coeff, L)
+            E = np.polyval(coeff, L) * self.unit.electron_volt / self.unit.angstrom**2
             if J_per_m2:
-                E *= 16.0219
-            results[k] = E
+                E = E.to(self.unit.joule / self.unit.meter**2)
+            results[k] = E.magnitude
         return results
 
     def get_angles(self):
@@ -314,6 +315,16 @@ class GrainBoundary:
             ].min()
         return results
 
+    def _get_job_energy(self, job):
+        conv = job['output/generic/dft/scf_convergence']
+        forces = np.linalg.norm(job['output/generic/forces'], axis=-1).max(axis=-1)
+        try:
+            if len(conv) != len(forces) and forces[np.where(conv)[0][-1]] > 0.01:
+                print('max force of', job.job_name, ':', forces[np.where(conv)[0][-1]])
+        except IndexError:
+            raise IndexError('Index Error on ' + job.job_name)
+        return job['output/generic/energy_pot'][conv][-1]
+
     def _get_segregation_energy(self, job_name, structure):
         E_lst = np.zeros(len(structure))
         equivalent_atoms = structure.get_symmetry(symprec=self.symprec).arg_equivalent_atoms
@@ -335,9 +346,10 @@ class GrainBoundary:
                 s in ['running', 'submitted']
                 for s in self.project.job_table(job=job_name_Mn).status
             ]):
+                print(job_name_Mn, 'running')
                 continue
-            spx = self.project.inspect(job_name_Mn)
-            E = spx['output/generic/energy_pot'][-1] - E_ref
+            spx = self.project.load(job_name_Mn)
+            E = self._get_job_energy(spx) - E_ref
             E_lst[equivalent_atoms == atom_id] = E
         return E_lst
 
@@ -383,4 +395,4 @@ class GrainBoundary:
                     print(spx.job_name)
                     spx.structure = structure.copy()
                     set_parameters(spx, n_cores=40)
-                    # spx.run()
+                    spx.run()
