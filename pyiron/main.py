@@ -253,7 +253,7 @@ class GrainBoundary:
                 if any([k.startswith(job_type) for k in self._energy_dict.keys()]):
                     continue
                 for spx in self.project.iter_jobs(
-                    job=f'{job_type}*', convert_to_object=False, progress=False
+                    job=f'{job_type}*', progress=False
                 ):
                     if len(self.project.job_table(job=f'{spx.job_name}_restart')) > 0:
                         continue
