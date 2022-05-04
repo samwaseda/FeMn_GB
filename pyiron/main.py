@@ -127,6 +127,7 @@ def set_parameters(spx, n_cores=40, queue='cm', random=True):
     if len(spx.structure.select_index('Mn')) > 1 and random:
         magmoms[ind_Mn] *= np.random.choice([1, -1], len(ind_Mn))
     spx.structure.set_initial_magnetic_moments(magmoms)
+    spx.set_occupancy_smearing(smearing='FermiDirac')
     spx.set_mixing_parameters(density_residual_scaling=0.1, spin_residual_scaling=0.1)
     spx.server.queue = queue
     spx.server.cores = n_cores
@@ -235,8 +236,16 @@ class GrainBoundary:
     @property
     def job_names(self):
         jobs = self.job_table().job
-        jobs = [job_name for job_name in jobs if not job_name.endswith('_restart')]
+        jobs = [job_name for job_name in jobs if 'restart' not in job_name]
         return np.unique(['_'.join(j.split('_')[:-1]) for j in jobs])
+
+    @staticmethod
+    def _get_next_job_name(job_name):
+        if 'restart' not in job_name:
+            return job_name + '_restart_0'
+        job_name = job_name.split('_')
+        job_name[-1] = str(int(job_name[-1]) + 1)
+        return '_'.join(job_name)
 
     @property
     def energy_dict(self):
@@ -252,13 +261,15 @@ class GrainBoundary:
                     continue
                 if any([k.startswith(job_type) for k in self._energy_dict.keys()]):
                     continue
+                all_jobs = list(self.project.job_table().job)
                 for spx in self.project.iter_jobs(
                     job=f'{job_type}*', progress=False
                 ):
-                    if len(self.project.job_table(job=f'{spx.job_name}_restart')) > 0:
+                    if self._get_next_job_name(spx.job_name) in all_jobs:
                         continue
+                    print(spx.job_name)
                     LL = np.diagonal(spx['output/generic/cells'][-1])
-                    EE = E_Fe * len(spx['input/structure/indices'])
+                    EE = E_Fe * len(spx['input/structure'])
                     self._energy_dict[job_type].append([
                         np.max(LL),
                         (spx['output/generic/energy_pot'][-1] - EE) / np.prod(np.sort(LL)[:2]) / 2
@@ -298,7 +309,7 @@ class GrainBoundary:
     def get_angles(self):
         results = {}
         for job_name in self.energy_dict.keys():
-            axis = [int(n) for n in job_name.split('_')[2].split('c')]
+            axis = [int(n) for n in job_name.split('_')[2].split('d')]
             sigma = int(job_name.split('_')[3])
             plane = []
             ss = ''
@@ -316,9 +327,11 @@ class GrainBoundary:
         return results
 
     def _get_job_energy(self, job):
-        conv = job['output/generic/dft/scf_convergence']
+        conv = np.array([len(e) < 100 for e in job['output/generic/dft/scf_energy_free']])
         forces = np.linalg.norm(job['output/generic/forces'], axis=-1).max(axis=-1)
         try:
+            if len(conv) - len(forces) == 1:
+                conv[-1] = False
             if len(conv) != len(forces) and forces[np.where(conv)[0][-1]] > 0.01:
                 print('max force of', job.job_name, ':', forces[np.where(conv)[0][-1]])
         except IndexError:
@@ -331,6 +344,7 @@ class GrainBoundary:
         gb_energy = self.get_gb_energy()[job_name] * np.sort(structure.cell.diagonal())[:2].prod()
         E_Fe = self.project.bulk.get_energy('Fe') * (len(structure) - 1)
         E_ref = 2 * gb_energy + E_Fe + self.project.bulk.get_energy('Mn', n_repeat=3)
+        all_jobs = list(self.project.job_table().job)
         for atom_id in np.unique(equivalent_atoms):
             job_name_Mn = '{}_{}'.format(job_name.replace('gb', 'gbMn'), atom_id)
             if len(self.project.job_table(job=job_name_Mn)) == 0:
@@ -340,8 +354,8 @@ class GrainBoundary:
                 set_parameters(spx)
                 spx.run()
                 continue
-            if len(self.project.job_table(job=f'{job_name_Mn}_restart')) > 0:
-                job_name_Mn = job_name_Mn + '_restart'
+            while self._get_next_job_name(job_name_Mn) in all_jobs:
+                job_name_Mn = self._get_next_job_name(job_name_Mn)
             if np.any([
                 s in ['running', 'submitted']
                 for s in self.project.job_table(job=job_name_Mn).status
