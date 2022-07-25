@@ -81,24 +81,22 @@ class LammpsGB:
     def list_gb(self):
         if self._list_gb is None:
             self._list_gb = defaultdict(list)
-            for ix in range(4):
-                for iy in range(ix + 1):
-                    for iz in range(iy + 1):
-                        axis = [ix, iy, iz]
-                        if np.gcd.reduce(axis) != 1:
+            axes = np.stack(np.meshgrid(*3 * [np.arange(4)]), axis=-1).reshape(-1, 3)
+            axes = axes[np.all(np.diff(axes, axis=-1) <= 0, axis=-1)]
+            axes = axes[np.gcd.reduce(axes, axis=-1) == 1]
+            for axis in axes:
+                for k, v in self.project.create.structure.aimsgb.info(
+                    axis, self.max_sigma
+                ).items():
+                    for p in np.unique(np.reshape(v['plane'], (-1, 3)), axis=0):
+                        str_e = self._get_lmp_gb(axis, k, p)
+                        if str_e is None:
                             continue
-                        for k, v in self.project.create.structure.aimsgb.info(
-                            axis, self.max_sigma
-                        ).items():
-                            for p in np.unique(np.reshape(v['plane'], (-1, 3)), axis=0):
-                                str_e = self._get_lmp_gb(axis, k, p)
-                                if str_e is None:
-                                    continue
-                                self._list_gb['energy'].append(str_e[1])
-                                self._list_gb['axis'].append(axis)
-                                self._list_gb['plane'].append(p)
-                                self._list_gb['sigma'].append(k)
-                                self._list_gb['structure'].append(str_e[0])
+                        self._list_gb['energy'].append(str_e[1])
+                        self._list_gb['axis'].append(axis)
+                        self._list_gb['plane'].append(p)
+                        self._list_gb['sigma'].append(k)
+                        self._list_gb['structure'].append(str_e[0])
             self._list_gb['id'] = np.unique(
                 np.round(self._list_gb['energy'], decimals=5), return_inverse=True
             )[1]
