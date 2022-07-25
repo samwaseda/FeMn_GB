@@ -5,19 +5,8 @@ import pint
 
 
 class Project(PyironProject):
-    def __init__(
-        self,
-        path='',
-        user=None,
-        sql_query=None,
-        default_working_directory=False,
-    ):
-        super().__init__(
-            path=path,
-            user=user,
-            sql_query=sql_query,
-            default_working_directory=default_working_directory,
-        )
+    def __init__(self, *args, **vargs):
+        super().__init__(*args, **vargs)
         self.lammps = LammpsGB(self)
         self.bulk = Bulk(self)
         self.grain_boundary = GrainBoundary(self)
