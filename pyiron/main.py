@@ -2,6 +2,7 @@ import numpy as np
 from collections import defaultdict
 from pyiron_atomistics import Project as PyironProject
 import pint
+from tqdm.auto import tqdm
 
 
 class Project(PyironProject):
@@ -17,8 +18,12 @@ class LammpsGB:
         self.project = project
         self.potential = '1997--Ackland-G-J--Fe--LAMMPS--ipr1'
         self.max_sigma = 100
+        self.max_axis = 4
         self.n_max = 100
+        self.cutoff_radius = 5
+        self._unique_gb = None
         self._list_gb = None
+        self.n_mesh_points = 11
 
     @property
     def bulk(self):
@@ -29,12 +34,13 @@ class LammpsGB:
     def _job_bulk(self):
         return self.get_job('bulk', self.project.create.structure.bulk('Fe', cubic=True))
 
-    def get_job(self, job_name, structure):
+    def get_job(self, job_name, structure, minimize=True, run=True):
         lmp = self.project.create.job.Lammps(job_name)
         lmp.structure = structure
         lmp.potential = self.potential
-        lmp.calc_minimize(pressure=0)
-        if lmp.status.initialized:
+        if minimize:
+            lmp.calc_minimize(pressure=[0, 0, 0])
+        if lmp.status.initialized and run:
             lmp.run()
         return lmp
 
@@ -49,6 +55,31 @@ class LammpsGB:
             plane=plane,
             target_width=target_width,
         )[0]
+
+    @property
+    def _meshgrid(self):
+        mesh = np.meshgrid(
+            *2 * [np.arange(self.n_mesh_points) / self.n_mesh_points]
+        )
+        return np.stack(mesh, axis=-1).reshape(-1, 2)
+
+    def _get_gamma_min(self, lmp, mesh):
+        structure = lmp.structure.copy()
+        cell_init = lmp.structure.cell.copy()
+        if lmp.status.initialized:
+            with lmp.interactive_open() as job:
+                layers = structure.analyse.get_layers(planes=[1, 0, 0])
+                for xx in mesh * structure.cell.diagonal()[1:]:
+                    job.structure = structure.copy()
+                    job.structure.positions[layers < layers.max() / 2, 1:] += xx
+                    job.run()
+        E, indices = np.unique(
+            np.round(lmp.output.energy_pot, decimals=8), return_index=True
+        )
+        structures = [lmp.get_structure(i) for i in indices]
+        for structure in structures:
+            structure.set_cell(cell_init, scale_atoms=True)
+        return E, structures
 
     def _get_lmp_gb(self, axis, sigma, plane, target_width=30):
         gb = self.project.create.structure.aimsgb.build(
@@ -69,38 +100,76 @@ class LammpsGB:
                     delete_layer=f'{i}b{j}t{i}b{j}t',
                     initial_struct=self.bulk
                 )
-                lmp = self.get_job(('lmp_gb', *axis, sigma, *plane, i, j), structure)
-                E_current = lmp.output.energy_pot[-1] - len(structure) * self.mu
-                if i + j == 0 or E_min > E_current + 1.0e-3:
+                lmp = self.get_job(
+                    ('lmp_gb', *axis, sigma, *plane, i, j), structure, run=False
+                )
+                E, struct = self._get_gamma_min(lmp, self._meshgrid)
+                E_current = E - len(structure) * self.mu
+                if i + j == 0 or np.min(E_min) > np.min(E_current) + 1.0e-3:
                     E_min = E_current
-                    min_structure = lmp.get_structure()
-                    min_structure.set_cell(lmp.output.cells[0], scale_atoms=True)
+                    min_structure = struct
         return min_structure, E_min
 
     @property
     def list_gb(self):
-        if self._list_gb is None:
-            self._list_gb = defaultdict(list)
-            axes = np.stack(np.meshgrid(*3 * [np.arange(4)]), axis=-1).reshape(-1, 3)
-            axes = axes[np.all(np.diff(axes, axis=-1) <= 0, axis=-1)]
-            axes = axes[np.gcd.reduce(axes, axis=-1) == 1]
-            for axis in axes:
-                for k, v in self.project.create.structure.aimsgb.info(
-                    axis, self.max_sigma
-                ).items():
-                    for p in np.unique(np.reshape(v['plane'], (-1, 3)), axis=0):
-                        str_e = self._get_lmp_gb(axis, k, p)
-                        if str_e is None:
-                            continue
-                        self._list_gb['energy'].append(str_e[1])
-                        self._list_gb['axis'].append(axis)
-                        self._list_gb['plane'].append(p)
-                        self._list_gb['sigma'].append(k)
-                        self._list_gb['structure'].append(str_e[0])
-            self._list_gb['id'] = np.unique(
-                np.round(self._list_gb['energy'], decimals=5), return_inverse=True
-            )[1]
-        return self._list_gb
+        if 'structure' not in list(self.unique_gb.keys()):
+            for sigma, plane, axis in zip(
+                self.unique_gb['sigma'],
+                self.unique_gb['plane'],
+                self.unique_gb['axis']
+            ):
+                str_e = self._get_lmp_gb(axis, sigma, plane)
+                if str_e is None:
+                    continue
+                self._unique_gb['structure'].append(str_e[0])
+                self._unique_gb['energy'].append(str_e[1])
+        return self.unique_gb
+
+    def _get_unique_gb(
+        self, initial_struct, max_axis=4, max_sigma=100, cutoff_radius=5
+    ):
+        list_gb = defaultdict(list)
+        axes = np.stack(
+            np.meshgrid(*3 * [np.arange(max_axis)]), axis=-1
+        ).reshape(-1, 3)
+        axes = axes[np.gcd.reduce(axes, axis=-1) == 1]
+        for axis in tqdm(axes):
+            for k, v in self.project.create.structure.aimsgb.info(
+                axis, max_sigma
+            ).items():
+                for p in np.asarray(v['plane'])[:, 0]:
+                    structure = self.project.create.structure.aimsgb.build(
+                        axis=axis, sigma=k, plane=p, initial_struct=initial_struct
+                    )
+                    if structure is None or len(structure) > 100:
+                        continue
+                    E = np.sum(
+                        1 / structure.get_neighbors(
+                            num_neighbors=None, cutoff_radius=cutoff_radius
+                        ).flattened.distances
+                    )
+                    list_gb['energy'].append(E)
+                    list_gb['axis'].append(axis)
+                    list_gb['plane'].append(p)
+                    list_gb['sigma'].append(k)
+        _, indices = np.unique(
+            np.round(list_gb['energy'], decimals=8), return_index=True
+        )
+        del list_gb['energy']
+        for k, v in list_gb.items():
+            list_gb[k] = np.asarray(v)[indices]
+        return list_gb
+
+    @property
+    def unique_gb(self):
+        if self._unique_gb is None:
+            self._unique_gb = self._get_unique_gb(
+                initial_struct=self.bulk,
+                max_axis=self.max_axis,
+                max_sigma=self.max_sigma,
+                cutoff_radius=self.cutoff_radius
+            )
+        return self._unique_gb
 
 
 def set_parameters(spx, n_cores=40, queue='cm', random=True):
@@ -285,7 +354,7 @@ class GrainBoundary:
 
     def get_gb_energy(self, J_per_m2=False):
         results = {}
-        for k, v in self.energy_dict.items():
+        for k, v in tqdm(self.energy_dict.items()):
             L, coeff = self._get_fit(*v.T, order=3)
             E = np.polyval(coeff, L) * self.unit.electron_volt / self.unit.angstrom**2
             if J_per_m2:
