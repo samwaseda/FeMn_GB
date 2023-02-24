@@ -3,6 +3,7 @@ from collections import defaultdict
 from pyiron_atomistics import Project as PyironProject
 import pint
 from tqdm.auto import tqdm
+import logging
 
 
 class Project(PyironProject):
@@ -221,6 +222,7 @@ def get_sqs(structure, steps=1000, num_neighbors=58):
 class Bulk:
     def __init__(self, project):
         self.project = project
+        self.e_dict = {}
 
     def run_murnaghan(self):
         spx = self.project.create.job.Sphinx('bulk_Fe')
@@ -238,24 +240,25 @@ class Bulk:
             raise ValueError('Wait for lattice constant to be ready')
         return murn['output/equilibrium_volume']**(1 / 3)
 
-    def get_energy(self, element, n_repeat=3, n_Mn=1):
+    def get_energy(self, element):
+        if element in self.e_dict.keys():
+            return self.e_dict[element]
         if element == 'Fe':
             murn = self.project.load('murn_Fe')
             if murn is None:
                 self.run_murnaghan()
                 return None
-            return murn['output/equilibrium_energy'] / 2
+            self.e_dict['Fe'] = murn['output/equilibrium_energy'] / 2
+            return self.e_dict['Fe']
         elif element == 'Mn':
-            murn = self.project.load('murn_sqs_{}_{}'.format(n_repeat, n_Mn))
-            if murn is None:
-                self.run_murnaghan()
-                return None
-            indices = murn['output/structure/indices']
-            N_Fe = np.sum(np.array(murn['output/structure/species'])[indices] == 'Fe')
-            coeff = np.polyfit(murn['output/volume'], murn['output/energy'], 3)
-            return np.polyval(
-                coeff, self.lattice_constant**3 * len(indices) / 2
-            ) - N_Fe * self.get_energy('Fe')
+            c_lst, E_lst = [], []
+            for murn in self.project.iter_jobs(job='murn_sqs*', hamilton='Murnaghan'):
+                c_lst.append([len(murn.structure.select_index('Fe')), len(murn.structure.select_index('Mn'))])
+                E_lst.append(murn['output/equilibrium_energy'])
+            c_lst = np.array(c_lst)
+            E_lst = np.array(E_lst)
+            self.e_dict['Mn'] = np.mean((E_lst - self.get_energy('Fe') * c_lst[:, 0]) / c_lst[:, 1])
+            return self.e_dict['Mn']
         else:
             raise ValueError(element, 'not recognized')
 
@@ -306,9 +309,10 @@ class GrainBoundary:
     @property
     def energy_dict(self):
         if self._energy_dict is None:
+            print('load energy_dict')
             self._energy_dict = defaultdict(list)
             E_Fe = self.project.bulk.get_energy('Fe')
-            for job_type in self.job_names:
+            for job_type in tqdm(self.job_names):
                 if any([
                     s in list(self.project.job_table(job=f'{job_type}*').status)
                     for s in ['submitted', 'running']
@@ -318,20 +322,19 @@ class GrainBoundary:
                 if any([k.startswith(job_type) for k in self._energy_dict.keys()]):
                     continue
                 all_jobs = list(self.project.job_table().job)
-                for spx in self.project.iter_jobs(
-                    job=f'{job_type}*', progress=False
-                ):
-                    if self._get_next_job_name(spx.job_name) in all_jobs:
+                for job_name in self.project.job_table(job=f'{job_type}*').job:
+                    if self._get_next_job_name(job_name) in all_jobs:
                         continue
-                    print(spx.job_name)
-                    LL = np.diagonal(spx['output/generic/cells'][-1])
-                    EE = E_Fe * len(spx['input/structure'])
+                    spx = self.load(job_name)
+                    LL = np.diagonal(self._parse_output(spx, 'generic/cells')[-1])
+                    EE = E_Fe * len(spx.structure)
                     self._energy_dict[job_type].append([
                         np.max(LL),
-                        (spx['output/generic/energy_pot'][-1] - EE) / np.prod(np.sort(LL)[:2]) / 2
+                        (self._parse_output(spx, 'generic/energy_pot')[-1] - EE) / np.prod(np.sort(LL)[:2]) / 2
                     ])
             for k, v in self._energy_dict.items():
                 self._energy_dict[k] = np.array(v)[np.argsort(v, axis=0)[:, 0]]
+            print('finish loading energy_dict')
         return self._energy_dict
 
     @staticmethod
@@ -345,7 +348,7 @@ class GrainBoundary:
         if len(self._structure_dict) == 0:
             for k, v in self.energy_dict.items():
                 L, coeff = self._get_fit(*v.T, order=3)
-                structure = self.project.load('{}_0d0'.format(k)).structure
+                structure = self.load('{}_0d0'.format(k)).structure
                 cell = structure.cell.flatten()
                 cell[cell.argmax()] = L
                 structure.set_cell(cell.reshape(3, 3), scale_atoms=True)
@@ -382,24 +385,40 @@ class GrainBoundary:
             ].min()
         return results
 
+    @staticmethod
+    def _parse_output(job, tag):
+        output = job['output']
+        tags = tag.split('/')
+        for ii, tt in enumerate(tags):
+            if ii < len(tags) - 1:
+                output = output[[ttt for ttt in output.list_groups() if ttt.startswith(tt)][0]]
+            else:
+                return output[[ttt for ttt in output.list_nodes() if ttt.startswith(tt)][0]]
+
     def _get_job_energy(self, job):
-        conv = np.array([len(e) < 100 for e in job['output/generic/dft/scf_energy_free']])
-        forces = np.linalg.norm(job['output/generic/forces'], axis=-1).max(axis=-1)
+        conv = np.array([len(e) < 100 for e in self._parse_output(job, 'generic/dft/scf_energy_free')])
+        forces = np.linalg.norm(self._parse_output(job, 'generic/forces'), axis=-1).max(axis=-1)
         try:
             if len(conv) - len(forces) == 1:
                 conv[-1] = False
+            if np.sum(conv) == 0:
+                residue = np.linalg.norm(self._parse_output(job, 'generic/dft/residue'), axis=-1)
+                if len(conv) - len(forces) == 1:
+                    residue[-1] = np.inf
+                logging.warning('min residue {}'.format(residue.min()))
+                conv[np.argmin(residue)] = True
             if len(conv) != len(forces) and forces[np.where(conv)[0][-1]] > 0.01:
-                print('max force of', job.job_name, ':', forces[np.where(conv)[0][-1]])
+                logging.warning('max force of', job.job_name, ':', forces[np.where(conv)[0][-1]])
         except IndexError:
             raise IndexError('Index Error on ' + job.job_name)
-        return job['output/generic/energy_pot'][conv][-1]
+        return self._parse_output(job, 'generic/energy_pot')[conv][-1]
 
     def _get_segregation_energy(self, job_name, structure):
         E_lst = np.zeros(len(structure))
         equivalent_atoms = structure.get_symmetry(symprec=self.symprec).arg_equivalent_atoms
         gb_energy = self.get_gb_energy()[job_name] * np.sort(structure.cell.diagonal())[:2].prod()
         E_Fe = self.project.bulk.get_energy('Fe') * (len(structure) - 1)
-        E_ref = 2 * gb_energy + E_Fe + self.project.bulk.get_energy('Mn', n_repeat=3)
+        E_ref = 2 * gb_energy + E_Fe + self.project.bulk.get_energy('Mn')
         all_jobs = list(self.project.job_table().job)
         for atom_id in np.unique(equivalent_atoms):
             job_name_Mn = '{}_{}'.format(job_name.replace('gb', 'gbMn'), atom_id)
@@ -418,19 +437,31 @@ class GrainBoundary:
             ]):
                 print(job_name_Mn, 'running')
                 continue
-            spx = self.project.load(job_name_Mn)
+            spx = self.load(job_name_Mn)
             E = self._get_job_energy(spx) - E_ref
             E_lst[equivalent_atoms == atom_id] = E
         return E_lst
 
+    def load(self, job_name):
+        spx = self.project.load(job_name)
+        if spx is None:
+            raise AssertionError('{} is None'.format(job_name))
+        if spx.status.running or spx.status.submitted:
+            return None
+        if spx.job_name.startswith('spx_') and not spx.is_compressed():
+            spx.collect_output()
+        return spx
+
     @property
     def segregation_energy(self):
         if self._segregation_energy is None:
+            logging.debug('load segregation energy')
             self._segregation_energy = {}
-            for job_name, structure in self.structures.items():
+            for job_name, structure in tqdm(self.structures.items()):
                 E_lst = self._get_segregation_energy(job_name, structure)
                 if np.all(E_lst != 0):
                     self._segregation_energy[job_name] = E_lst
+            logging.debug('finish loading segregation energy')
         return self._segregation_energy
 
     @property
@@ -455,14 +486,13 @@ class GrainBoundary:
             for i in range(10):
                 structure = self.structures[job_name].copy()
                 structure[np.random.random(len(E)) < self.get_occ_probability(E)] = 'Mn'
-                for j in range(7):
+                for j in range(10):
                     spx = self.project.create.job.Sphinx((
                         job_name.replace('gb', 'gbMnMn'),
                         self.temperature, self.concentration, i, j
                     ))
                     if not spx.status.initialized:
                         continue
-                    print(spx.job_name)
                     spx.structure = structure.copy()
                     set_parameters(spx, n_cores=40)
                     spx.run()
