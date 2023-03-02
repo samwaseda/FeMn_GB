@@ -47,7 +47,7 @@ class LammpsGB:
 
     @property
     def mu(self):
-        return self._job_bulk['output/generic/energy_pot'][-1] / 2
+        return self._job_bulk.output.generic.energy_pot[-1] / 2
 
     def get_lmp_gb(self, axis, sigma, plane, target_width=30):
         return self._get_lmp_gb(
@@ -326,11 +326,11 @@ class GrainBoundary:
                     if self._get_next_job_name(job_name) in all_jobs:
                         continue
                     spx = self.load(job_name)
-                    LL = np.diagonal(self._parse_output(spx, 'generic/cells')[-1])
+                    LL = np.diagonal(spx.output.generic.cells[-1])
                     EE = E_Fe * len(spx.structure)
                     self._energy_dict[job_type].append([
                         np.max(LL),
-                        (self._parse_output(spx, 'generic/energy_pot')[-1] - EE) / np.prod(np.sort(LL)[:2]) / 2
+                        (spx.output.generic.energy_pot[-1] - EE) / np.prod(np.sort(LL)[:2]) / 2
                     ])
             for k, v in self._energy_dict.items():
                 self._energy_dict[k] = np.array(v)[np.argsort(v, axis=0)[:, 0]]
@@ -385,24 +385,14 @@ class GrainBoundary:
             ].min()
         return results
 
-    @staticmethod
-    def _parse_output(job, tag):
-        output = job['output']
-        tags = tag.split('/')
-        for ii, tt in enumerate(tags):
-            if ii < len(tags) - 1:
-                output = output[[ttt for ttt in output.list_groups() if ttt.startswith(tt)][0]]
-            else:
-                return output[[ttt for ttt in output.list_nodes() if ttt.startswith(tt)][0]]
-
     def _get_job_energy(self, job):
-        conv = np.array([len(e) < 100 for e in self._parse_output(job, 'generic/dft/scf_energy_free')])
-        forces = np.linalg.norm(self._parse_output(job, 'generic/forces'), axis=-1).max(axis=-1)
+        conv = np.array([len(e) < 100 for e in job.output.generic.dft.scf_energy_free])
+        forces = np.linalg.norm(job.output.generic.forces, axis=-1).max(axis=-1)
         try:
             if len(conv) - len(forces) == 1:
                 conv[-1] = False
             if np.sum(conv) == 0:
-                residue = np.linalg.norm(self._parse_output(job, 'generic/dft/residue'), axis=-1)
+                residue = np.linalg.norm(job.output.generic.dft.residue, axis=-1)
                 if len(conv) - len(forces) == 1:
                     residue[-1] = np.inf
                 logging.warning('min residue {}'.format(residue.min()))
@@ -411,7 +401,7 @@ class GrainBoundary:
                 logging.warning('max force of', job.job_name, ':', forces[np.where(conv)[0][-1]])
         except IndexError:
             raise IndexError('Index Error on ' + job.job_name)
-        return self._parse_output(job, 'generic/energy_pot')[conv][-1]
+        return job.output.generic.energy_pot[conv][-1]
 
     def _get_segregation_energy(self, job_name, structure):
         E_lst = np.zeros(len(structure))
@@ -462,7 +452,7 @@ class GrainBoundary:
                 if np.all(E_lst != 0):
                     self._segregation_energy[job_name] = E_lst
             logging.debug('finish loading segregation energy')
-        return self._segregation_energy
+        return self._segregation_energy.copy()
 
     @property
     def c_0(self):
